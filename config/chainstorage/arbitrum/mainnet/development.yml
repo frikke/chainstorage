@@ -8,3 +8,8 @@ chain:
   block_start_height: 15000000
 server:
   bind_address: 0.0.0.0:9090
+sla:
+  expected_workflows:
+  - monitor
+  - poller
+  - streamer

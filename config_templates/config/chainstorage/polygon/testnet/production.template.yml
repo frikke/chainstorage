@@ -1,0 +1,5 @@
+aws:
+  bucket: example-chainstorage-{{blockchain}}-{{network}}-{{short_env}}
+  aws_account: production
+cadence:
+  address: temporal.example.com:7233

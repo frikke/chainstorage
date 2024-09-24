@@ -1,0 +1,23 @@
+name: "Setup"
+description: "setup environment"
+inputs:
+  go-version:
+    description: "Golang version to use"
+    required: false
+    default: "1.20"
+runs:
+  using: "composite"
+  steps:
+    - name: Set up go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ inputs.go-version }}
+    - name: Install asdf & tools
+      uses: asdf-vm/actions/setup@v2
+    - name: Setup
+      shell: bash
+      run: |
+        asdf plugin-add protoc
+        asdf install protoc 25.2
+        asdf global protoc 25.2
+        make bootstrap

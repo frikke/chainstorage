@@ -1,0 +1,10 @@
+aws:
+  aws_account: development
+  bucket: example-chainstorage-{{blockchain}}-{{network}}-{{short_env}}
+chain:
+  block_start_height: 30000000
+workflows:
+  poller:
+    session_enabled: true
+  cross_validator:
+    validation_percentage: 10

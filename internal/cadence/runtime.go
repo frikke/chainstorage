@@ -3,39 +3,40 @@ package cadence
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
-	"github.com/uber-go/tally"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
+	sdktally "go.temporal.io/sdk/contrib/tally"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/types/known/durationpb"
 	zapadapter "logur.dev/adapter/zap"
 	"logur.dev/logur"
 
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	"github.com/coinbase/chainstorage/internal/utils/log"
+	"github.com/coinbase/chainstorage/internal/utils/retry"
 	"github.com/coinbase/chainstorage/internal/utils/timesource"
 )
 
 type (
 	Runtime interface {
-		RegisterWorkflow(w interface{}, options workflow.RegisterOptions)
-		RegisterActivity(a interface{}, options activity.RegisterOptions)
-		ExecuteWorkflow(ctx context.Context, options client.StartWorkflowOptions, workflow interface{}, request interface{}) (client.WorkflowRun, error)
-		ExecuteActivity(ctx workflow.Context, activity interface{}, request interface{}, response interface{}) error
+		RegisterWorkflow(w any, options workflow.RegisterOptions)
+		RegisterActivity(a any, options activity.RegisterOptions)
+		ExecuteWorkflow(ctx context.Context, options client.StartWorkflowOptions, workflow any, request any) (client.WorkflowRun, error)
+		ExecuteActivity(ctx workflow.Context, activity any, request any, response any) error
 		GetLogger(ctx workflow.Context) *zap.Logger
-		GetScope(ctx workflow.Context) tally.Scope
+		GetMetricsHandler(ctx workflow.Context) client.MetricsHandler
 		GetActivityLogger(ctx context.Context) *zap.Logger
-		GetActivityScope(ctx context.Context) tally.Scope
 		GetTimeSource(ctx workflow.Context) timesource.TimeSource
 		TerminateWorkflow(ctx context.Context, workflowID string, runID string, reason string) error
 		OnStart(ctx context.Context) error
@@ -46,7 +47,6 @@ type (
 	RuntimeParams struct {
 		fx.In
 		fxparams.Params
-		Tracer  opentracing.Tracer
 		TestEnv *TestEnv `optional:"true"`
 	}
 
@@ -69,25 +69,42 @@ func NewRuntime(params RuntimeParams) (Runtime, error) {
 	runtimeLogger := logur.LoggerToKV(zapadapter.New(logger))
 
 	address := params.Config.Cadence.Address
+	tlsConfig := params.Config.Cadence.TLSConfig
 	connectionOptions := client.ConnectionOptions{}
-	if params.Config.Env() != config.EnvLocal {
+	if tlsConfig.Enabled && params.Config.Env() != config.EnvLocal {
 		host, _, err := net.SplitHostPort(address)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to parse address (%v): %w", address, err)
 		}
 
 		connectionOptions.TLS = &tls.Config{
-			ServerName: host,
-			MinVersion: tls.VersionTLS12,
+			MinVersion:         tls.VersionTLS12,
+			ServerName:         host,
+			InsecureSkipVerify: !tlsConfig.ValidateHostname,
+		}
+
+		if tlsConfig.CertificateAuthority != "" {
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM([]byte(tlsConfig.CertificateAuthority)) {
+				return nil, xerrors.Errorf("failed to parse CA certificate: %v", tlsConfig.CertificateAuthority)
+			}
+			connectionOptions.TLS.RootCAs = caCertPool
+		}
+
+		if tlsConfig.ClientCertificate != "" && tlsConfig.ClientPrivateKey != "" {
+			clientCert, err := tls.X509KeyPair([]byte(tlsConfig.ClientCertificate), []byte(tlsConfig.ClientPrivateKey))
+			if err != nil {
+				return nil, xerrors.Errorf("failed to parse client certificate or key (%v): %w", tlsConfig.ClientCertificate, err)
+			}
+			connectionOptions.TLS.Certificates = []tls.Certificate{clientCert}
 		}
 	}
 
 	options := client.Options{
 		Namespace:         params.Config.Cadence.Domain,
 		HostPort:          address,
-		MetricsScope:      params.Metrics,
+		MetricsHandler:    sdktally.NewMetricsHandler(params.Metrics),
 		Logger:            runtimeLogger,
-		Tracer:            params.Tracer,
 		ConnectionOptions: connectionOptions,
 	}
 
@@ -96,7 +113,7 @@ func NewRuntime(params RuntimeParams) (Runtime, error) {
 		return nil, xerrors.Errorf("failed to create namespace client: %w", err)
 	}
 
-	workflowClient, err := client.NewClient(options)
+	workflowClient, err := client.Dial(options)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to create workflow client: %w", err)
 	}
@@ -107,7 +124,10 @@ func NewRuntime(params RuntimeParams) (Runtime, error) {
 			workflowClient,
 			workerConfig.TaskList,
 			worker.Options{
+				// Enable this option to allow worker to process sessions. Defaults to false.
 				EnableSessionWorker: true,
+				// If set defines maximum amount of time that workflow task will be allowed to run. Defaults to 1 sec.
+				DeadlockDetectionTimeout: 2 * time.Second,
 			},
 		)
 	}
@@ -135,23 +155,23 @@ func (r *runtimeImpl) ListOpenWorkflows(ctx context.Context, namespace string, m
 	return openWorkflows, nil
 }
 
-func (r *runtimeImpl) RegisterWorkflow(w interface{}, options workflow.RegisterOptions) {
+func (r *runtimeImpl) RegisterWorkflow(w any, options workflow.RegisterOptions) {
 	for _, worker := range r.workers {
 		worker.RegisterWorkflowWithOptions(w, options)
 	}
 }
 
-func (r *runtimeImpl) RegisterActivity(a interface{}, options activity.RegisterOptions) {
+func (r *runtimeImpl) RegisterActivity(a any, options activity.RegisterOptions) {
 	for _, worker := range r.workers {
 		worker.RegisterActivityWithOptions(a, options)
 	}
 }
 
-func (r *runtimeImpl) ExecuteWorkflow(ctx context.Context, options client.StartWorkflowOptions, workflow interface{}, request interface{}) (client.WorkflowRun, error) {
+func (r *runtimeImpl) ExecuteWorkflow(ctx context.Context, options client.StartWorkflowOptions, workflow any, request any) (client.WorkflowRun, error) {
 	return r.workflowClient.ExecuteWorkflow(ctx, options, workflow, request)
 }
 
-func (r *runtimeImpl) ExecuteActivity(ctx workflow.Context, activity interface{}, request interface{}, response interface{}) error {
+func (r *runtimeImpl) ExecuteActivity(ctx workflow.Context, activity any, request any, response any) error {
 	future := workflow.ExecuteActivity(ctx, activity, request)
 	return future.Get(ctx, response)
 }
@@ -161,17 +181,13 @@ func (r *runtimeImpl) GetLogger(ctx workflow.Context) *zap.Logger {
 	return log.FromTemporal(logger)
 }
 
-func (r *runtimeImpl) GetScope(ctx workflow.Context) tally.Scope {
-	return workflow.GetMetricsScope(ctx)
+func (r *runtimeImpl) GetMetricsHandler(ctx workflow.Context) client.MetricsHandler {
+	return workflow.GetMetricsHandler(ctx)
 }
 
 func (r *runtimeImpl) GetActivityLogger(ctx context.Context) *zap.Logger {
 	logger := activity.GetLogger(ctx)
 	return log.FromTemporal(logger)
-}
-
-func (r *runtimeImpl) GetActivityScope(ctx context.Context) tally.Scope {
-	return activity.GetMetricsScope(ctx)
 }
 
 func (r *runtimeImpl) GetTimeSource(ctx workflow.Context) timesource.TimeSource {
@@ -212,7 +228,7 @@ func (r *runtimeImpl) startDomain(ctx context.Context) error {
 	retentionPeriod := 24 * time.Hour * time.Duration(cadenceConfig.RetentionPeriod)
 	err := r.namespaceClient.Register(ctx, &workflowservice.RegisterNamespaceRequest{
 		Namespace:                        cadenceConfig.Domain,
-		WorkflowExecutionRetentionPeriod: &retentionPeriod,
+		WorkflowExecutionRetentionPeriod: durationpb.New(retentionPeriod),
 	})
 	if err != nil {
 		if _, ok := err.(*serviceerror.NamespaceAlreadyExists); !ok {
@@ -222,9 +238,16 @@ func (r *runtimeImpl) startDomain(ctx context.Context) error {
 		r.logger.Info("domain name is already registered", zap.String("domain", cadenceConfig.Domain))
 	}
 
-	describeResponse, err := r.namespaceClient.Describe(ctx, cadenceConfig.Domain)
+	describeResponse, err := retry.WrapWithResult(ctx, func(ctx context.Context) (*workflowservice.DescribeNamespaceResponse, error) {
+		res, err := r.namespaceClient.Describe(ctx, cadenceConfig.Domain)
+		if err != nil {
+			return nil, retry.Retryable(xerrors.Errorf("failed to register cadence domain: %w", err))
+		}
+
+		return res, nil
+	})
 	if err != nil {
-		return xerrors.Errorf("failed to register cadence domain: %w", err)
+		return err
 	}
 
 	r.logger.Info("started cadence domain", zap.Reflect("response", describeResponse))

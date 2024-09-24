@@ -1,15 +1,14 @@
 package fixtures
 
 import (
-	"bytes"
 	"encoding/json"
 	"os"
 	"path"
 	"runtime"
 
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/coinbase/chainstorage/internal/utils/finalizer"
 )
@@ -51,7 +50,7 @@ func WriteFile(relPath string, data []byte) error {
 	return finalizer.Close()
 }
 
-func UnmarshalJSON(pathToFile string, out interface{}) error {
+func UnmarshalJSON(pathToFile string, out any) error {
 	data, err := ReadFile(pathToFile)
 	if err != nil {
 		return xerrors.Errorf("failed to read file %v: %w", pathToFile, err)
@@ -64,13 +63,13 @@ func UnmarshalJSON(pathToFile string, out interface{}) error {
 	return nil
 }
 
-func MustUnmarshalJSON(pathToFile string, out interface{}) {
+func MustUnmarshalJSON(pathToFile string, out any) {
 	if err := UnmarshalJSON(pathToFile, out); err != nil {
 		panic(err)
 	}
 }
 
-func MarshalJSON(pathToFile string, in interface{}) error {
+func MarshalJSON(pathToFile string, in any) error {
 	data, err := json.MarshalIndent(in, "", "  ")
 	if err != nil {
 		return xerrors.Errorf("failed to marshal input: %w", err)
@@ -83,7 +82,7 @@ func MarshalJSON(pathToFile string, in interface{}) error {
 	return nil
 }
 
-func MustMarshalJSON(pathToFile string, in interface{}) {
+func MustMarshalJSON(pathToFile string, in any) {
 	if err := MarshalJSON(pathToFile, in); err != nil {
 		panic(err)
 	}
@@ -95,7 +94,7 @@ func UnmarshalPB(pathToFile string, out proto.Message) error {
 		return xerrors.Errorf("failed to read file %v: %w", pathToFile, err)
 	}
 
-	if err := jsonpb.Unmarshal(bytes.NewReader(data), out); err != nil {
+	if err := protojson.Unmarshal(data, out); err != nil {
 		return xerrors.Errorf("failed to unmarshal file %v: %w", pathToFile, err)
 	}
 
@@ -109,13 +108,15 @@ func MustUnmarshalPB(pathToFile string, out proto.Message) {
 }
 
 func MarshalPB(pathToFile string, in proto.Message) error {
-	marshaler := jsonpb.Marshaler{Indent: "  "}
-	var buf bytes.Buffer
-	if err := marshaler.Marshal(&buf, in); err != nil {
+	marshaler := protojson.MarshalOptions{Indent: "  "}
+
+	var buf []byte
+	var err error
+	if buf, err = marshaler.Marshal(in); err != nil {
 		return xerrors.Errorf("failed to marshal input: %w", err)
 	}
 
-	if err := WriteFile(pathToFile, buf.Bytes()); err != nil {
+	if err := WriteFile(pathToFile, buf); err != nil {
 		return xerrors.Errorf("failed to write to file: %w", err)
 	}
 

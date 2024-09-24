@@ -4,6 +4,9 @@ gomocks:
       - MetaStorage
       - EventStorage
       - BlockStorage
+      - TransactionStorage
+  - package: internal/storage/metastorage/dynamodb
+    interfaces:
       - DynamoAPI
   - package: internal/storage/blobstorage
     interfaces:
@@ -29,6 +32,10 @@ gomocks:
   - package: internal/blockchain/client
     interfaces:
       - Client
+  - package: internal/blockchain/restapi
+    interfaces:
+      - Client
+      - HTTPClient
   - package: protos/coinbase/chainstorage
     interfaces:
       - ChainStorageClient

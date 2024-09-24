@@ -1,12 +1,14 @@
 package utils
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/golang/protobuf/ptypes/timestamp"
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
@@ -25,17 +27,17 @@ func ParseCompression(compression string) (api.Compression, error) {
 	return api.Compression(parsedCompression), nil
 }
 
-func ToTimestamp(seconds int64) *timestamp.Timestamp {
+func ToTimestamp(seconds int64) *timestamppb.Timestamp {
 	if seconds == 0 {
 		return nil
 	}
 
-	return &timestamp.Timestamp{
+	return &timestamppb.Timestamp{
 		Seconds: seconds,
 	}
 }
 
-func SinceTimestamp(timestamp *timestamp.Timestamp) time.Duration {
+func SinceTimestamp(timestamp *timestamppb.Timestamp) time.Duration {
 	var res time.Duration
 	if timestamp.GetSeconds() > 0 || timestamp.GetNanos() > 0 {
 		if t := timestamp.AsTime(); !t.IsZero() {
@@ -44,6 +46,13 @@ func SinceTimestamp(timestamp *timestamp.Timestamp) time.Duration {
 	}
 
 	return res
+}
+
+// GenerateSha256HashString A hash function to obfuscate the input string.
+// This is to prevent the input from being leaked to the public.
+func GenerateSha256HashString(input string) string {
+	hash := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(hash[:])
 }
 
 // ParseBlockchain converts a blockchain name, e.g. `ethereum`, to the proto definition,
@@ -76,4 +85,20 @@ func ParseNetwork(networkName string) (common.Network, error) {
 	}
 
 	return common.Network(parsedNetwork), nil
+}
+
+// ParseSidechain converts a sidechain name, e.g. `ethereum-mainnet-beacon`, to the proto definition,
+// e.g. `api.SideChain_SIDECHAIN_ETHEREUM_MAINNET_BEACON`
+func ParseSidechain(sidechainName string) (api.SideChain, error) {
+	formattedSidechainName := fmt.Sprintf(
+		"SIDECHAIN_%s",
+		strings.Replace(strings.ToUpper(sidechainName), "-", "_", 2),
+	)
+	parsedSidechain, ok := api.SideChain_value[formattedSidechainName]
+	if !ok {
+		return api.SideChain_SIDECHAIN_NONE,
+			fmt.Errorf("error sidechain name: `%s` did not parse correctly to an enum", sidechainName)
+	}
+
+	return api.SideChain(parsedSidechain), nil
 }

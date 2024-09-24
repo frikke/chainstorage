@@ -5,13 +5,15 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/sdk/testsuite"
 	"go.uber.org/fx"
+	"go.uber.org/mock/gomock"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client"
 	clientmocks "github.com/coinbase/chainstorage/internal/blockchain/client/mocks"
+	"github.com/coinbase/chainstorage/internal/blockchain/jsonrpc"
+	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/cadence"
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage"
@@ -26,9 +28,9 @@ import (
 const (
 	validatorTag                = uint32(1)
 	validatorStartHeight        = uint64(100)
-	validatorClientLatestHeight = uint64(1400)
+	validatorClientLatestHeight = uint64(700)
 	validatorMaxHeightIngested  = uint64(430)
-	validatorMaxReorgDistance   = uint64(500)
+	validatorMaxReorgDistance   = uint64(100)
 	validatorHeightPadding      = validatorMaxReorgDistance * validationHeightPaddingMultiplier
 	validatorBatchSize          = 290
 	validatorCheckpointSize     = 2
@@ -45,6 +47,7 @@ type crossValidatorTestSuite struct {
 	metaStorage     *metastoragemocks.MockMetaStorage
 	blobStorage     *blobstoragemocks.MockBlobStorage
 	crossValidator  *CrossValidator
+	parser          parser.Parser
 	app             testapp.TestApp
 	cfg             *config.Config
 }
@@ -76,6 +79,7 @@ func (s *crossValidatorTestSuite) SetupTest() {
 		Module,
 		testapp.WithConfig(cfg),
 		cadence.WithTestEnv(s.env),
+		parser.Module,
 		fx.Provide(func() blobstorage.BlobStorage {
 			return s.blobStorage
 		}),
@@ -89,6 +93,7 @@ func (s *crossValidatorTestSuite) SetupTest() {
 			return s.metaStorage
 		}),
 		fx.Populate(&s.crossValidator),
+		fx.Populate(&s.parser),
 	)
 }
 
@@ -133,7 +138,7 @@ func (s *crossValidatorTestSuite) TestCrossValidator() {
 		})
 	s.validatorClient.EXPECT().GetBlockByHash(gomock.Any(), validatorTag, gomock.Any(), gomock.Any()).
 		Times(int(validatorEndHeight - validatorStartHeight)).
-		DoAndReturn(func(ctx context.Context, tag uint32, height uint64, hash string) (*api.Block, error) {
+		DoAndReturn(func(ctx context.Context, tag uint32, height uint64, hash string, opts ...jsonrpc.Option) (*api.Block, error) {
 			seen.validatorClient.LoadOrStore(height, true)
 			return testutil.MakeBlock(height, tag), nil
 		})

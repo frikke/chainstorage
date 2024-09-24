@@ -15,4 +15,12 @@ var Module = fx.Options(
 	fx.Provide(NewMonitor),
 	fx.Provide(NewStreamer),
 	fx.Provide(NewCrossValidator),
+	fx.Provide(NewEventBackfiller),
+	fx.Provide(NewReplicator),
+)
+
+const (
+	resultTypeTag     = "result_type"
+	resultTypeSuccess = "success"
+	resultTypeError   = "error"
 )

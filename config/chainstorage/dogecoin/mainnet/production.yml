@@ -6,8 +6,3 @@ cadence:
   address: temporal.example.com:7233
 server:
   bind_address: 0.0.0.0:9090
-sla:
-  expected_workflows:
-  - monitor
-  - poller
-  - streamer

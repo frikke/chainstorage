@@ -1,16 +1,15 @@
 package testutil
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"testing"
 
 	rt "github.com/coinbase/rosetta-sdk-go/types"
-	"github.com/golang/protobuf/jsonpb"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/coinbase/chainstorage/internal/utils/fixtures"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
@@ -109,10 +108,24 @@ func LoadRawBlock(file string) (*api.Block, error) {
 
 	var rawBlock api.Block
 
-	u := jsonpb.Unmarshaler{}
-	if err := u.Unmarshal(bytes.NewBuffer(data), &rawBlock); err != nil {
+	if err := protojson.Unmarshal(data, &rawBlock); err != nil {
 		return nil, err
 	}
 
 	return &rawBlock, nil
+}
+
+func LoadNativeBlock(file string) (*api.EthereumBlock, error) {
+	data, err := fixtures.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+
+	var block api.EthereumBlock
+
+	if err := protojson.Unmarshal(data, &block); err != nil {
+		return nil, err
+	}
+
+	return &block, nil
 }

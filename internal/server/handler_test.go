@@ -2,25 +2,32 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/aws/request"
+	awsClient "github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/awstesting"
 	"github.com/aws/aws-sdk-go/awstesting/unit"
-	awss3 "github.com/aws/aws-sdk-go/service/s3"
-	"github.com/golang/mock/gomock"
+	geth "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/fx"
+	"go.uber.org/mock/gomock"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/coinbase/chainstorage/internal/blockchain/client"
+	clientmocks "github.com/coinbase/chainstorage/internal/blockchain/client/mocks"
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
+	"github.com/coinbase/chainstorage/internal/blockchain/parser/ethereum"
+	parsermocks "github.com/coinbase/chainstorage/internal/blockchain/parser/mocks"
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/s3"
 	s3mocks "github.com/coinbase/chainstorage/internal/s3/mocks"
@@ -32,6 +39,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
 	storage_utils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/consts"
+	"github.com/coinbase/chainstorage/internal/utils/fixtures"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
@@ -53,16 +61,32 @@ var (
 		Height:     9001,
 		FileUrl:    "http://endpoint/bar",
 	}
+
+	fixtureAccountProof = `{
+		"address": "0xabcd",
+		"accountProof": [
+		  "0xf8718080a00dbf96d37e082bfef0d434cbfbd17bb037d8aeffadaf3013edc78787f9226f4080808080a0c8ad32d5e9043e624f4e6d0b95c51b814c8083fa3d14f6ccf2f53062ed695378808080a067a873077ca5dea2f6c1b727b3271c48acb15702960b97dd64922a057bb94ddf8080808080",
+		  "0xf8729d20c40458670ea9af82f482725d75274f17aaa170da081ad4905b5eb0e9b852f850830455908901a305459586047662a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+		],
+		"balance": "0x1a305459586047662",
+		"codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+		"nonce": "0x45590",
+		"storageHash": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+		"storageProof": []
+	}`
 )
 
 type handlerTestSuite struct {
 	suite.Suite
 	ctrl                  *gomock.Controller
 	app                   testapp.TestApp
-	awsClient             *client.Client
+	awsClient             *awsClient.Client
 	metaStorage           *metastoragemocks.MockMetaStorage
 	blobStorage           *blobstoragemocks.MockBlobStorage
+	transactionStorage    *metastoragemocks.MockTransactionStorage
 	s3Client              *s3mocks.MockClient
+	blockchainClient      *clientmocks.MockClient
+	parser                *parsermocks.MockParser
 	server                *Server
 	config                *config.Config
 	tagForTestEvents      uint32
@@ -80,19 +104,31 @@ func (s *handlerTestSuite) SetupTest() {
 	})
 	s.metaStorage = metastoragemocks.NewMockMetaStorage(s.ctrl)
 	s.blobStorage = blobstoragemocks.NewMockBlobStorage(s.ctrl)
+	s.transactionStorage = metastoragemocks.NewMockTransactionStorage(s.ctrl)
 	s.s3Client = s3mocks.NewMockClient(s.ctrl)
+	s.blockchainClient = clientmocks.NewMockClient(s.ctrl)
+	s.parser = parsermocks.NewMockParser(s.ctrl)
 	s.app = testapp.New(
 		s.T(),
-		parser.Module,
 		fx.Provide(func() metastorage.MetaStorage { return s.metaStorage }),
 		fx.Provide(func() blobstorage.BlobStorage { return s.blobStorage }),
+		fx.Provide(func() metastorage.TransactionStorage { return s.transactionStorage }),
 		fx.Provide(func() s3.Client { return s.s3Client }),
+		fx.Provide(fx.Annotated{
+			Name: "slave",
+			Target: func() client.Client {
+				return s.blockchainClient
+			},
+		}),
+		fx.Provide(func() parser.Parser { return s.parser }),
 		fx.Provide(NewServer),
 		fx.Populate(&s.server),
 		fx.Populate(&s.config),
 	)
 	s.tagForTestEvents = 1
-	s.eventTagForTestEvents = 0
+	s.eventTagForTestEvents = s.config.Chain.EventTag.Stable
+	s.config.Chain.Feature.TransactionIndexing = true
+	s.config.Chain.Feature.VerifiedAccountStateEnabled = true
 }
 
 func (s *handlerTestSuite) TearDownTest() {
@@ -204,11 +240,10 @@ func (s *handlerTestSuite) TestGetBlockFile() {
 				}, nil
 			},
 		),
-		s.s3Client.EXPECT().GetObjectRequest(gomock.Any()).Times(1).DoAndReturn(
-			func(req *awss3.GetObjectInput) (*request.Request, *awss3.GetObjectOutput) {
-				require.Equal("example-chainstorage-ethereum-mainnet-dev", *req.Bucket)
-				require.Equal(objectKeyMain, *req.Key)
-				return s.newAwsPresignRequest("name", "GET", objectKeyMain), nil
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(_ context.Context, key string) (string, error) {
+				require.Equal(objectKeyMain, key)
+				return "http://endpoint/foo/bar", nil
 			},
 		),
 	)
@@ -255,11 +290,10 @@ func (s *handlerTestSuite) TestGetBlockFile_Gzip() {
 				}, nil
 			},
 		),
-		s.s3Client.EXPECT().GetObjectRequest(gomock.Any()).Times(1).DoAndReturn(
-			func(req *awss3.GetObjectInput) (*request.Request, *awss3.GetObjectOutput) {
-				require.Equal("example-chainstorage-ethereum-mainnet-dev", *req.Bucket)
-				require.Equal(objectKeyMain, *req.Key)
-				return s.newAwsPresignRequest("name", "GET", objectKeyMain), nil
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(_ context.Context, key string) (string, error) {
+				require.Equal(objectKeyMain, key)
+				return "http://endpoint/foo/bar.gzip", nil
 			},
 		),
 	)
@@ -396,22 +430,16 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_PresignErr() {
 				}, nil
 			},
 		),
-		s.s3Client.EXPECT().GetObjectRequest(gomock.Any()).Times(1).DoAndReturn(
-			func(req *awss3.GetObjectInput) (*request.Request, *awss3.GetObjectOutput) {
-				require.Equal("example-chainstorage-ethereum-mainnet-dev", *req.Bucket)
-				require.Equal("foo", *req.Key)
-				return s.awsClient.NewRequest(&request.Operation{
-					Name:       "name",
-					HTTPMethod: "GET",
-					HTTPPath:   "/foo",
-				}, &struct{}{}, &struct{}{}), nil
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(_ context.Context, key string) (string, error) {
+				require.Equal("foo", key)
+				return "http://endpoint/foo", nil
 			},
 		),
-		s.s3Client.EXPECT().GetObjectRequest(gomock.Any()).Times(1).DoAndReturn(
-			func(req *awss3.GetObjectInput) (*request.Request, *awss3.GetObjectOutput) {
-				require.Equal("example-chainstorage-ethereum-mainnet-dev", *req.Bucket)
-				require.Equal("bar", *req.Key)
-				return s.newAwsPresignFailedRequest(), nil
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(_ context.Context, key string) (string, error) {
+				require.Equal("bar", key)
+				return "", fmt.Errorf("failed")
 			},
 		),
 	)
@@ -451,18 +479,16 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange() {
 				}, nil
 			},
 		),
-		s.s3Client.EXPECT().GetObjectRequest(gomock.Any()).Times(1).DoAndReturn(
-			func(req *awss3.GetObjectInput) (*request.Request, *awss3.GetObjectOutput) {
-				require.Equal("example-chainstorage-ethereum-mainnet-dev", *req.Bucket)
-				require.Equal("foo", *req.Key)
-				return s.newAwsPresignRequest("name", "GET", "/foo"), nil
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(_ context.Context, key string) (string, error) {
+				require.Equal("foo", key)
+				return "http://endpoint/foo", nil
 			},
 		),
-		s.s3Client.EXPECT().GetObjectRequest(gomock.Any()).Times(1).DoAndReturn(
-			func(req *awss3.GetObjectInput) (*request.Request, *awss3.GetObjectOutput) {
-				require.Equal("example-chainstorage-ethereum-mainnet-dev", *req.Bucket)
-				require.Equal("bar", *req.Key)
-				return s.newAwsPresignRequest("name", "GET", "/bar"), nil
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(_ context.Context, key string) (string, error) {
+				require.Equal("bar", key)
+				return "http://endpoint/bar", nil
 			},
 		),
 	)
@@ -817,6 +843,11 @@ func (s *handlerTestSuite) TestGetNativeBlockByRange() {
 				return block, nil
 			},
 		),
+		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+				return testutil.MakeNativeBlock(rawBlock.Metadata.Height, tag), nil
+			},
+		),
 	)
 
 	resp, err := s.server.GetNativeBlock(context.Background(), &api.GetNativeBlockRequest{
@@ -826,11 +857,11 @@ func (s *handlerTestSuite) TestGetNativeBlockByRange() {
 	})
 	require.NoError(err)
 	require.NotNil(resp)
-	nativeBlock := resp.Block.GetEthereum()
+	nativeBlock := resp.Block
 	require.NotNil(nativeBlock)
-	require.Equal(blockMetadata.Hash, nativeBlock.Header.Hash)
-	require.Equal(blockMetadata.ParentHash, nativeBlock.Header.ParentHash)
-	require.Equal(blockMetadata.Height, nativeBlock.Header.Number)
+	require.Equal(blockMetadata.Hash, nativeBlock.Hash)
+	require.Equal(blockMetadata.ParentHash, nativeBlock.ParentHash)
+	require.Equal(blockMetadata.Height, nativeBlock.Height)
 }
 
 func (s *handlerTestSuite) TestGetNativeBlocksByRange() {
@@ -871,6 +902,11 @@ func (s *handlerTestSuite) TestGetNativeBlocksByRange() {
 				return block, nil
 			},
 		),
+		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(numBlocks).DoAndReturn(
+			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+				return testutil.MakeNativeBlock(rawBlock.Metadata.Height, tag), nil
+			},
+		),
 	)
 
 	resp, err := s.server.GetNativeBlocksByRange(context.Background(), &api.GetNativeBlocksByRangeRequest{
@@ -882,11 +918,11 @@ func (s *handlerTestSuite) TestGetNativeBlocksByRange() {
 	require.NotNil(resp)
 	require.Len(resp.Blocks, numBlocks)
 	for i := 0; i < numBlocks; i++ {
-		nativeBlock := resp.Blocks[i].GetEthereum()
+		nativeBlock := resp.Blocks[i]
 		require.NotNil(nativeBlock)
-		require.Equal(blockMetadatas[i].Hash, nativeBlock.Header.Hash)
-		require.Equal(blockMetadatas[i].ParentHash, nativeBlock.Header.ParentHash)
-		require.Equal(blockMetadatas[i].Height, nativeBlock.Header.Number)
+		require.Equal(blockMetadatas[i].Hash, nativeBlock.Hash)
+		require.Equal(blockMetadatas[i].ParentHash, nativeBlock.ParentHash)
+		require.Equal(blockMetadatas[i].Height, nativeBlock.Height)
 	}
 }
 
@@ -914,6 +950,11 @@ func (s *handlerTestSuite) TestGetRosettaBlock() {
 				return block, nil
 			},
 		),
+		s.parser.EXPECT().ParseRosettaBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, rawBlock *api.Block) (*api.RosettaBlock, error) {
+				return testutil.MakeRosettaBlock(rawBlock.Metadata.Height, tag), nil
+			},
+		),
 	)
 
 	resp, err := s.server.GetRosettaBlock(context.Background(), &api.GetRosettaBlockRequest{
@@ -935,11 +976,18 @@ func (s *handlerTestSuite) TestGetRosettaBlock_NotImplemented() {
 	var server *Server
 	app := testapp.New(
 		s.T(),
-		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET), // Solana RosettaParser is not implemented
+		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_AVACCHAIN, common.Network_NETWORK_AVACCHAIN_MAINNET), // AVACCHAIN RosettaParser is not implemented
 		parser.Module,
 		fx.Provide(func() metastorage.MetaStorage { return s.metaStorage }),
 		fx.Provide(func() blobstorage.BlobStorage { return s.blobStorage }),
+		fx.Provide(func() metastorage.TransactionStorage { return s.transactionStorage }),
 		fx.Provide(func() s3.Client { return s.s3Client }),
+		fx.Provide(fx.Annotated{
+			Name: "slave",
+			Target: func() client.Client {
+				return s.blockchainClient
+			},
+		}),
 		fx.Provide(NewServer),
 		fx.Populate(&server),
 	)
@@ -1011,6 +1059,11 @@ func (s *handlerTestSuite) TestGetRosettaBlocksByRange() {
 				return block, nil
 			},
 		),
+		s.parser.EXPECT().ParseRosettaBlock(gomock.Any(), gomock.Any()).Times(numBlocks).DoAndReturn(
+			func(ctx context.Context, rawBlock *api.Block) (*api.RosettaBlock, error) {
+				return testutil.MakeRosettaBlock(rawBlock.Metadata.Height, tag), nil
+			},
+		),
 	)
 
 	resp, err := s.server.GetRosettaBlocksByRange(context.Background(), &api.GetRosettaBlocksByRangeRequest{
@@ -1038,11 +1091,18 @@ func (s *handlerTestSuite) TestGetRosettaBlocksByRange_NotImplemented() {
 	var server *Server
 	app := testapp.New(
 		s.T(),
-		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET), // Solana RosettaParser is not implemented
+		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_AVACCHAIN, common.Network_NETWORK_AVACCHAIN_MAINNET), // Avacchain RosettaParser is not implemented
 		parser.Module,
 		fx.Provide(func() metastorage.MetaStorage { return s.metaStorage }),
 		fx.Provide(func() blobstorage.BlobStorage { return s.blobStorage }),
+		fx.Provide(func() metastorage.TransactionStorage { return s.transactionStorage }),
 		fx.Provide(func() s3.Client { return s.s3Client }),
+		fx.Provide(fx.Annotated{
+			Name: "slave",
+			Target: func() client.Client {
+				return s.blockchainClient
+			},
+		}),
 		fx.Provide(NewServer),
 		fx.Populate(&server),
 	)
@@ -1087,20 +1147,6 @@ func (s *handlerTestSuite) TestGetRosettaBlocksByRange_NotImplemented() {
 	})
 	require.Error(err)
 	s.verifyStatusCode(codes.Unimplemented, err)
-}
-
-func (s *handlerTestSuite) newAwsPresignFailedRequest() *request.Request {
-	return s.awsClient.NewRequest(&request.Operation{
-		BeforePresignFn: func(r *request.Request) error { return fmt.Errorf("fail") },
-	}, &struct{}{}, &struct{}{})
-}
-
-func (s *handlerTestSuite) newAwsPresignRequest(name, method, path string) *request.Request {
-	return s.awsClient.NewRequest(&request.Operation{
-		Name:       name,
-		HTTPMethod: method,
-		HTTPPath:   path,
-	}, &struct{}{}, &struct{}{})
 }
 
 func (s *handlerTestSuite) TestStreamChainEvents_WithSequence() {
@@ -1194,6 +1240,126 @@ func (s *handlerTestSuite) TestStreamChainEventsNonDefaultEventTag() {
 	err := s.server.StreamChainEvents(&api.ChainEventsRequest{
 		SequenceNum: startEventId - 1,
 		EventTag:    eventTag,
+	}, mockServer)
+	require.NoError(err)
+	require.Len(mockServer.events, int(endEventId+1-startEventId))
+	for i, event := range mockServer.events {
+		eventDDBEntry := eventDDBEntries[i]
+		require.NotNil(event)
+		require.Equal(eventDDBEntry.EventId, event.SequenceNum)
+		require.Equal(eventDDBEntry.BlockHash, event.Block.Hash)
+		require.Equal(eventDDBEntry.BlockHeight, event.Block.Height)
+		require.Equal(s.tagForTestEvents, event.Block.Tag)
+		require.Equal(eventTag, event.EventTag)
+	}
+}
+
+func (s *handlerTestSuite) TestStreamChainEvents_ZeroEventTagToDefault() {
+	require := testutil.Require(s.T())
+	s.config.Chain.EventTag.Latest = 2
+	s.config.Chain.EventTag.Stable = 2
+	s.config.Chain.Feature.DefaultStableEvent = true
+	const (
+		startEventId int64  = 100
+		endEventId   int64  = 300
+		eventTag     uint32 = 2
+	)
+
+	eventDDBEntries := testutil.MakeBlockEventEntries(
+		api.BlockchainEvent_BLOCK_ADDED,
+		eventTag, endEventId, uint64(startEventId), uint64(endEventId+1), s.tagForTestEvents,
+	)
+
+	s.metaStorage.EXPECT().GetEventsAfterEventId(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+		func(ctx context.Context, eventTag uint32, eventId int64, maxEvents uint64) ([]*model.EventEntry, error) {
+			if eventTag == 2 {
+				start := int(eventId + 1 - startEventId)
+				if start >= len(eventDDBEntries) {
+					return []*model.EventEntry{}, nil
+				}
+				end := int(eventId + 1 - startEventId + int64(maxEvents))
+				if end > len(eventDDBEntries) {
+					end = len(eventDDBEntries)
+				}
+				return eventDDBEntries[start:end], nil
+			} else {
+				return []*model.EventEntry{}, nil
+			}
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mockServer := &mockStreamChainEventsServer{
+		events: make([]*api.BlockchainEvent, 0),
+		ctx:    ctx,
+	}
+	go func() {
+		time.Sleep(2 * time.Second)
+		cancel()
+	}()
+	err := s.server.StreamChainEvents(&api.ChainEventsRequest{
+		SequenceNum: startEventId - 1,
+	}, mockServer)
+	require.NoError(err)
+	require.Len(mockServer.events, int(endEventId+1-startEventId))
+	for i, event := range mockServer.events {
+		eventDDBEntry := eventDDBEntries[i]
+		require.NotNil(event)
+		require.Equal(eventDDBEntry.EventId, event.SequenceNum)
+		require.Equal(eventDDBEntry.BlockHash, event.Block.Hash)
+		require.Equal(eventDDBEntry.BlockHeight, event.Block.Height)
+		require.Equal(s.tagForTestEvents, event.Block.Tag)
+		require.Equal(eventTag, event.EventTag)
+	}
+}
+
+func (s *handlerTestSuite) TestStreamChainEvents_InitialPositionLatest_ZeroEventTagToDefault() {
+	require := testutil.Require(s.T())
+	s.config.Chain.EventTag.Latest = 2
+	s.config.Chain.EventTag.Stable = 2
+	s.config.Chain.Feature.DefaultStableEvent = true
+	const (
+		startEventId int64  = 100
+		endEventId   int64  = 300
+		eventTag     uint32 = 2
+	)
+
+	eventDDBEntries := testutil.MakeBlockEventEntries(
+		api.BlockchainEvent_BLOCK_ADDED,
+		eventTag, endEventId, uint64(startEventId), uint64(endEventId+1), s.tagForTestEvents,
+	)
+
+	s.metaStorage.EXPECT().GetEventsAfterEventId(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+		func(ctx context.Context, eventTag uint32, eventId int64, maxEvents uint64) ([]*model.EventEntry, error) {
+			if eventTag == 2 {
+				start := int(eventId + 1 - startEventId)
+				if start >= len(eventDDBEntries) {
+					return []*model.EventEntry{}, nil
+				}
+				end := int(eventId + 1 - startEventId + int64(maxEvents))
+				if end > len(eventDDBEntries) {
+					end = len(eventDDBEntries)
+				}
+				return eventDDBEntries[start:end], nil
+			} else {
+				return []*model.EventEntry{}, nil
+			}
+		},
+	)
+
+	s.metaStorage.EXPECT().GetMaxEventId(gomock.Any(), eventTag).Times(1).Return(startEventId, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mockServer := &mockStreamChainEventsServer{
+		events: make([]*api.BlockchainEvent, 0),
+		ctx:    ctx,
+	}
+	go func() {
+		time.Sleep(2 * time.Second)
+		cancel()
+	}()
+	err := s.server.StreamChainEvents(&api.ChainEventsRequest{
+		InitialPositionInStream: InitialPositionLatest,
 	}, mockServer)
 	require.NoError(err)
 	require.Len(mockServer.events, int(endEventId+1-startEventId))
@@ -1609,19 +1775,19 @@ func (s *handlerTestSuite) TestStreamBackoff_Expired() {
 	require.Equal(streamingBackoffStop, duration)
 }
 
-func (s *handlerTestSuite) setupMetaStorageForEvents(eventTag uint32, startEventId int64, endEventId int64) []*model.EventDDBEntry {
-	eventDDBEntries := testutil.MakeBlockEventDDBEntries(
+func (s *handlerTestSuite) setupMetaStorageForEvents(eventTag uint32, startEventId int64, endEventId int64) []*model.EventEntry {
+	eventDDBEntries := testutil.MakeBlockEventEntries(
 		api.BlockchainEvent_BLOCK_ADDED,
 		eventTag, endEventId, uint64(startEventId), uint64(endEventId+1), s.tagForTestEvents,
 	)
 
 	require := testutil.Require(s.T())
 	s.metaStorage.EXPECT().GetEventsAfterEventId(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
-		func(ctx context.Context, eventTag uint32, eventId int64, maxEvents uint64) ([]*model.EventDDBEntry, error) {
+		func(ctx context.Context, eventTag uint32, eventId int64, maxEvents uint64) ([]*model.EventEntry, error) {
 			require.Equal(s.config.Api.StreamingBatchSize, maxEvents)
 			start := int(eventId + 1 - startEventId)
 			if start >= len(eventDDBEntries) {
-				return []*model.EventDDBEntry{}, nil
+				return []*model.EventEntry{}, nil
 			}
 			end := int(eventId + 1 - startEventId + int64(maxEvents))
 			if end > len(eventDDBEntries) {
@@ -1786,6 +1952,108 @@ func (s *handlerTestSuite) TestGetChainEventsNonDefaultEventTag() {
 	}
 }
 
+func (s *handlerTestSuite) TestGetChainEvents_ZeroEventTagToDefault() {
+	require := testutil.Require(s.T())
+	s.config.Chain.EventTag.Latest = 2
+	s.config.Chain.EventTag.Stable = 2
+	s.config.Chain.Feature.DefaultStableEvent = true
+	eventTag := uint32(2)
+	lastSeenEventId := int64(99)
+	startEventId := lastSeenEventId + 1
+	maxNumEvents := int64(s.config.Api.StreamingBatchSize) // this is required to use setupMetaStorageForEvents
+	endEventId := startEventId + maxNumEvents + 1 + 50
+	eventDDBEntries := testutil.MakeBlockEventEntries(
+		api.BlockchainEvent_BLOCK_ADDED,
+		eventTag, endEventId, uint64(startEventId), uint64(endEventId+1), s.tagForTestEvents,
+	)
+
+	s.metaStorage.EXPECT().GetEventsAfterEventId(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+		func(ctx context.Context, eventTag uint32, eventId int64, maxEvents uint64) ([]*model.EventEntry, error) {
+			if eventTag == 2 {
+				start := int(eventId + 1 - startEventId)
+				if start >= len(eventDDBEntries) {
+					return []*model.EventEntry{}, nil
+				}
+				end := int(eventId + 1 - startEventId + int64(maxEvents))
+				if end > len(eventDDBEntries) {
+					end = len(eventDDBEntries)
+				}
+				return eventDDBEntries[start:end], nil
+			} else {
+				return []*model.EventEntry{}, nil
+			}
+		},
+	)
+
+	resp, err := s.server.GetChainEvents(context.Background(), &api.GetChainEventsRequest{
+		SequenceNum:  lastSeenEventId,
+		MaxNumEvents: uint64(maxNumEvents),
+	})
+	require.NoError(err)
+	require.Len(resp.Events, int(maxNumEvents))
+	for i, event := range resp.Events {
+		eventDDBEntry := eventDDBEntries[i]
+		require.NotNil(event)
+		require.Equal(eventDDBEntry.EventId, event.SequenceNum)
+		require.Equal(eventDDBEntry.BlockHash, event.Block.Hash)
+		require.Equal(eventDDBEntry.BlockHeight, event.Block.Height)
+		require.Equal(s.tagForTestEvents, event.Block.Tag)
+		require.Equal(eventTag, event.EventTag)
+	}
+}
+
+func (s *handlerTestSuite) TestGetChainEvents_InitialPositionLatest_ZeroEventTagToDefault() {
+	require := testutil.Require(s.T())
+	s.config.Chain.EventTag.Latest = 2
+	s.config.Chain.EventTag.Stable = 2
+	s.config.Chain.Feature.DefaultStableEvent = true
+	eventTag := uint32(2)
+	lastSeenEventId := int64(99)
+	startEventId := lastSeenEventId + 1
+	maxNumEvents := int64(s.config.Api.StreamingBatchSize) // this is required to use setupMetaStorageForEvents
+	endEventId := startEventId + maxNumEvents + 1 + 50
+	eventDDBEntries := testutil.MakeBlockEventEntries(
+		api.BlockchainEvent_BLOCK_ADDED,
+		eventTag, endEventId, uint64(startEventId), uint64(endEventId+1), s.tagForTestEvents,
+	)
+
+	s.metaStorage.EXPECT().GetEventsAfterEventId(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+		func(ctx context.Context, eventTag uint32, eventId int64, maxEvents uint64) ([]*model.EventEntry, error) {
+			if eventTag == 2 {
+				start := int(eventId + 1 - startEventId)
+				if start >= len(eventDDBEntries) {
+					return []*model.EventEntry{}, nil
+				}
+				end := int(eventId + 1 - startEventId + int64(maxEvents))
+				if end > len(eventDDBEntries) {
+					end = len(eventDDBEntries)
+				}
+				return eventDDBEntries[start:end], nil
+			} else {
+				return []*model.EventEntry{}, nil
+			}
+		},
+	)
+
+	s.metaStorage.EXPECT().GetMaxEventId(gomock.Any(), eventTag).Times(1).Return(startEventId, nil)
+
+	resp, err := s.server.GetChainEvents(context.Background(), &api.GetChainEventsRequest{
+		InitialPositionInStream: InitialPositionLatest,
+		MaxNumEvents:            uint64(maxNumEvents),
+	})
+	require.NoError(err)
+	require.Len(resp.Events, int(maxNumEvents))
+	for i, event := range resp.Events {
+		eventDDBEntry := eventDDBEntries[i]
+		require.NotNil(event)
+		require.Equal(eventDDBEntry.EventId, event.SequenceNum)
+		require.Equal(eventDDBEntry.BlockHash, event.Block.Hash)
+		require.Equal(eventDDBEntry.BlockHeight, event.Block.Height)
+		require.Equal(s.tagForTestEvents, event.Block.Tag)
+		require.Equal(eventTag, event.EventTag)
+	}
+}
+
 func (s *handlerTestSuite) TestGetChainEventsInvalidEventTag() {
 	require := testutil.Require(s.T())
 	// latest < eventTag
@@ -1928,7 +2196,7 @@ func (s *handlerTestSuite) TestGetVersionedChainEvent_WithFromSequence() {
 	)
 	require := testutil.Require(s.T())
 
-	fromEvent := &model.EventDDBEntry{
+	fromEvent := &model.EventEntry{
 		EventId:     fromEventId,
 		EventType:   api.BlockchainEvent_BLOCK_ADDED,
 		BlockHeight: blockHeight,
@@ -1937,13 +2205,13 @@ func (s *handlerTestSuite) TestGetVersionedChainEvent_WithFromSequence() {
 		EventTag:    fromEventTag,
 	}
 	s.metaStorage.EXPECT().GetEventByEventId(gomock.Any(), fromEventTag, fromEventId).Times(1).DoAndReturn(
-		func(ctx context.Context, eventTag uint32, eventId int64) (*model.EventDDBEntry, error) {
+		func(ctx context.Context, eventTag uint32, eventId int64) (*model.EventEntry, error) {
 			return fromEvent, nil
 		},
 	)
 	s.metaStorage.EXPECT().GetEventsByBlockHeight(gomock.Any(), toEventTag, fromEvent.BlockHeight).Times(1).DoAndReturn(
-		func(ctx context.Context, eventTag uint32, blockHeight uint64) ([]*model.EventDDBEntry, error) {
-			return []*model.EventDDBEntry{
+		func(ctx context.Context, eventTag uint32, blockHeight uint64) ([]*model.EventEntry, error) {
+			return []*model.EventEntry{
 				{
 					EventId:     toEventId,
 					EventType:   api.BlockchainEvent_BLOCK_ADDED,
@@ -1996,7 +2264,7 @@ func (s *handlerTestSuite) TestGetVersionedChainEvent_WithFromSequenceNum() {
 	)
 	require := testutil.Require(s.T())
 
-	fromEvent := &model.EventDDBEntry{
+	fromEvent := &model.EventEntry{
 		EventId:     fromEventId,
 		EventType:   api.BlockchainEvent_BLOCK_ADDED,
 		BlockHeight: blockHeight,
@@ -2005,13 +2273,13 @@ func (s *handlerTestSuite) TestGetVersionedChainEvent_WithFromSequenceNum() {
 		EventTag:    fromEventTag,
 	}
 	s.metaStorage.EXPECT().GetEventByEventId(gomock.Any(), fromEventTag, fromEventId).Times(1).DoAndReturn(
-		func(ctx context.Context, eventTag uint32, eventId int64) (*model.EventDDBEntry, error) {
+		func(ctx context.Context, eventTag uint32, eventId int64) (*model.EventEntry, error) {
 			return fromEvent, nil
 		},
 	)
 	s.metaStorage.EXPECT().GetEventsByBlockHeight(gomock.Any(), toEventTag, fromEvent.BlockHeight).Times(1).DoAndReturn(
-		func(ctx context.Context, eventTag uint32, blockHeight uint64) ([]*model.EventDDBEntry, error) {
-			return []*model.EventDDBEntry{
+		func(ctx context.Context, eventTag uint32, blockHeight uint64) ([]*model.EventEntry, error) {
+			return []*model.EventEntry{
 				{
 					EventId:     toEventId,
 					EventType:   api.BlockchainEvent_BLOCK_ADDED,
@@ -2064,7 +2332,7 @@ func (s *handlerTestSuite) TestGetVersionedChainEvent_NoMatchingEvent() {
 	)
 	require := testutil.Require(s.T())
 
-	fromEvent := &model.EventDDBEntry{
+	fromEvent := &model.EventEntry{
 		EventId:     fromEventId,
 		EventType:   api.BlockchainEvent_BLOCK_ADDED,
 		BlockHeight: blockHeight,
@@ -2073,13 +2341,13 @@ func (s *handlerTestSuite) TestGetVersionedChainEvent_NoMatchingEvent() {
 		EventTag:    fromEventTag,
 	}
 	s.metaStorage.EXPECT().GetEventByEventId(gomock.Any(), fromEventTag, fromEventId).Times(1).DoAndReturn(
-		func(ctx context.Context, eventTag uint32, eventId int64) (*model.EventDDBEntry, error) {
+		func(ctx context.Context, eventTag uint32, eventId int64) (*model.EventEntry, error) {
 			return fromEvent, nil
 		},
 	)
 	s.metaStorage.EXPECT().GetEventsByBlockHeight(gomock.Any(), toEventTag, fromEvent.BlockHeight).Times(1).DoAndReturn(
-		func(ctx context.Context, eventTag uint32, blockHeight uint64) ([]*model.EventDDBEntry, error) {
-			return []*model.EventDDBEntry{
+		func(ctx context.Context, eventTag uint32, blockHeight uint64) ([]*model.EventEntry, error) {
+			return []*model.EventEntry{
 				{
 					EventId:     toEventId,
 					EventType:   api.BlockchainEvent_BLOCK_REMOVED,
@@ -2098,4 +2366,725 @@ func (s *handlerTestSuite) TestGetVersionedChainEvent_NoMatchingEvent() {
 		ToEventTag:      toEventTag,
 	})
 	require.Error(err)
+}
+
+func (s *handlerTestSuite) TestGetBlockByTransaction() {
+	require := testutil.Require(s.T())
+	stableTag := s.app.Config().GetStableBlockTag()
+	transactionHash := "foo"
+
+	txs := []*model.Transaction{
+		{
+			Hash:        "foo",
+			BlockNumber: 100,
+			BlockHash:   "100a",
+			BlockTag:    stableTag,
+		},
+		{
+			Hash:        "foo",
+			BlockNumber: 101,
+			BlockHash:   "100b",
+			BlockTag:    stableTag,
+		},
+	}
+
+	s.transactionStorage.EXPECT().GetTransaction(gomock.Any(), stableTag, transactionHash).Times(1).Return(txs, nil)
+	s.metaStorage.EXPECT().GetBlocksByHeights(gomock.Any(), stableTag, gomock.Any()).Times(1).
+		DoAndReturn(func(ctx context.Context, tag uint32, heights []uint64) ([]*api.BlockMetadata, error) {
+			require.Len(heights, 2)
+			sort.Slice(heights, func(i, j int) bool {
+				return heights[i] < heights[j]
+			})
+			require.Equal([]uint64{100, 101}, heights)
+			return []*api.BlockMetadata{
+				{
+					Tag:    stableTag,
+					Hash:   "100c",
+					Height: 100,
+				},
+				{
+					Tag:    stableTag,
+					Hash:   "100b",
+					Height: 101,
+				},
+			}, nil
+		})
+
+	resp, err := s.server.GetBlockByTransaction(context.Background(), &api.GetBlockByTransactionRequest{
+		TransactionHash: transactionHash,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Len(resp.GetBlocks(), 1)
+	require.Equal(&api.BlockIdentifier{
+		Tag:    stableTag,
+		Hash:   "100b",
+		Height: 101,
+	}, resp.GetBlocks()[0])
+}
+
+func (s *handlerTestSuite) TestGetBlockByTransaction_DuplicateBlockNums() {
+	require := testutil.Require(s.T())
+	stableTag := s.app.Config().GetStableBlockTag()
+	transactionHash := "foo"
+
+	txs := []*model.Transaction{
+		{
+			Hash:        "foo",
+			BlockNumber: 100,
+			BlockHash:   "100a",
+			BlockTag:    stableTag,
+		},
+		{
+			Hash:        "foo",
+			BlockNumber: 100,
+			BlockHash:   "100b",
+			BlockTag:    stableTag,
+		},
+	}
+
+	s.transactionStorage.EXPECT().GetTransaction(gomock.Any(), stableTag, transactionHash).Times(1).Return(txs, nil)
+	s.metaStorage.EXPECT().GetBlocksByHeights(gomock.Any(), stableTag, gomock.Any()).Times(1).
+		DoAndReturn(func(ctx context.Context, tag uint32, heights []uint64) ([]*api.BlockMetadata, error) {
+			require.Len(heights, 1)
+			require.Equal([]uint64{100}, heights)
+			return []*api.BlockMetadata{
+				{
+					Tag:    stableTag,
+					Hash:   "100b",
+					Height: 100,
+				},
+			}, nil
+		})
+
+	resp, err := s.server.GetBlockByTransaction(context.Background(), &api.GetBlockByTransactionRequest{
+		TransactionHash: transactionHash,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Len(resp.GetBlocks(), 1)
+	require.Equal(&api.BlockIdentifier{
+		Tag:    stableTag,
+		Hash:   "100b",
+		Height: 100,
+	}, resp.GetBlocks()[0])
+}
+
+func (s *handlerTestSuite) TestGetBlockByTransaction_MultipleBlocks() {
+	require := testutil.Require(s.T())
+	stableTag := s.app.Config().GetStableBlockTag()
+	transactionHash := "foo"
+
+	txs := []*model.Transaction{
+		{
+			Hash:        "foo",
+			BlockNumber: 100,
+			BlockHash:   "100a",
+			BlockTag:    stableTag,
+		},
+		{
+			Hash:        "foo",
+			BlockNumber: 101,
+			BlockHash:   "100c",
+			BlockTag:    stableTag,
+		},
+		{
+			Hash:        "foo",
+			BlockNumber: 101,
+			BlockHash:   "100b",
+			BlockTag:    stableTag,
+		},
+	}
+
+	s.transactionStorage.EXPECT().GetTransaction(gomock.Any(), stableTag, transactionHash).Times(1).Return(txs, nil)
+	s.metaStorage.EXPECT().GetBlocksByHeights(gomock.Any(), stableTag, gomock.Any()).Times(1).
+		DoAndReturn(func(ctx context.Context, tag uint32, heights []uint64) ([]*api.BlockMetadata, error) {
+			require.Len(heights, 2)
+			sort.Slice(heights, func(i, j int) bool {
+				return heights[i] < heights[j]
+			})
+			require.Equal([]uint64{100, 101}, heights)
+			return []*api.BlockMetadata{
+				{
+					Tag:    stableTag,
+					Hash:   "100b",
+					Height: 101,
+				},
+				{
+					Tag:    stableTag,
+					Hash:   "100a",
+					Height: 100,
+				},
+			}, nil
+		})
+
+	resp, err := s.server.GetBlockByTransaction(context.Background(), &api.GetBlockByTransactionRequest{
+		TransactionHash: transactionHash,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Len(resp.GetBlocks(), 2)
+	require.Equal(&api.BlockIdentifier{
+		Tag:    stableTag,
+		Hash:   "100a",
+		Height: 100,
+	}, resp.GetBlocks()[0])
+	require.Equal(&api.BlockIdentifier{
+		Tag:    stableTag,
+		Hash:   "100b",
+		Height: 101,
+	}, resp.GetBlocks()[1])
+}
+
+func (s *handlerTestSuite) TestGetBlockByTransaction_NoMatch() {
+	require := testutil.Require(s.T())
+	stableTag := s.app.Config().GetStableBlockTag()
+	transactionHash := "foo"
+	txs := []*model.Transaction{
+		{
+			Hash:        "foo",
+			BlockNumber: 100,
+			BlockHash:   "100a",
+			BlockTag:    stableTag,
+		},
+	}
+
+	s.transactionStorage.EXPECT().GetTransaction(gomock.Any(), stableTag, transactionHash).Times(1).Return(txs, nil)
+	s.metaStorage.EXPECT().GetBlocksByHeights(gomock.Any(), stableTag, gomock.Any()).Times(1).
+		DoAndReturn(func(ctx context.Context, tag uint32, heights []uint64) ([]*api.BlockMetadata, error) {
+			require.Len(heights, 1)
+			require.Equal([]uint64{100}, heights)
+			return []*api.BlockMetadata{
+				{
+					Tag:    stableTag,
+					Hash:   "100c",
+					Height: 100,
+				},
+			}, nil
+		})
+
+	resp, err := s.server.GetBlockByTransaction(context.Background(), &api.GetBlockByTransactionRequest{
+		TransactionHash: transactionHash,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Len(resp.GetBlocks(), 0)
+}
+
+func (s *handlerTestSuite) TestGetBlockByTransaction_TxNotFound() {
+	require := testutil.Require(s.T())
+	stableTag := s.app.Config().GetStableBlockTag()
+	transactionHash := "foo"
+
+	s.transactionStorage.EXPECT().GetTransaction(gomock.Any(), stableTag, transactionHash).Times(1).
+		Return(nil, xerrors.New("failed to get transaction"))
+
+	resp, err := s.server.GetBlockByTransaction(context.Background(), &api.GetBlockByTransactionRequest{
+		TransactionHash: transactionHash,
+	})
+	require.Error(err)
+	require.Nil(resp)
+}
+
+func (s *handlerTestSuite) TestGetBlockByTransaction_ErrGetBlockByHeight() {
+	require := testutil.Require(s.T())
+	stableTag := s.app.Config().GetStableBlockTag()
+	transactionHash := "foo"
+
+	txs := []*model.Transaction{
+		{
+			Hash:        "foo",
+			BlockNumber: 100,
+			BlockHash:   "100a",
+			BlockTag:    stableTag,
+		},
+	}
+
+	s.transactionStorage.EXPECT().GetTransaction(gomock.Any(), stableTag, transactionHash).Times(1).Return(txs, nil)
+	s.metaStorage.EXPECT().GetBlocksByHeights(gomock.Any(), stableTag, gomock.Any()).Times(1).
+		DoAndReturn(func(ctx context.Context, tag uint32, heights []uint64) ([]*api.BlockMetadata, error) {
+			require.Len(heights, 1)
+			require.Equal([]uint64{100}, heights)
+			return nil, xerrors.New("failed to get blockMetadata")
+		})
+
+	resp, err := s.server.GetBlockByTransaction(context.Background(), &api.GetBlockByTransactionRequest{
+		TransactionHash: transactionHash,
+	})
+	require.Error(err)
+	require.Nil(resp)
+}
+
+func (s *handlerTestSuite) TestGetNativeTransaction() {
+	require := testutil.Require(s.T())
+
+	stableTag := s.config.GetStableBlockTag()
+	transactionHash := "foo"
+
+	blockMetadata := testutil.MakeBlockMetadata(100, stableTag)
+	rawBlock := testutil.MakeBlock(100, stableTag)
+	nativeBlock := &api.NativeBlock{}
+	nativeTransaction := &api.NativeTransaction{}
+	txs := []*model.Transaction{
+		{
+			Hash:        transactionHash,
+			BlockNumber: blockMetadata.Height,
+			BlockHash:   blockMetadata.Hash,
+			BlockTag:    stableTag,
+		},
+	}
+
+	gomock.InOrder(
+		s.transactionStorage.EXPECT().
+			GetTransaction(gomock.Any(), stableTag, transactionHash).
+			Return(txs, nil),
+		s.metaStorage.EXPECT().
+			GetBlocksByHeights(gomock.Any(), stableTag, gomock.Any()).
+			Return([]*api.BlockMetadata{blockMetadata}, nil),
+		s.blobStorage.EXPECT().
+			Download(gomock.Any(), gomock.Any()).
+			Return(rawBlock, nil),
+		s.parser.EXPECT().
+			ParseNativeBlock(gomock.Any(), rawBlock).
+			Return(nativeBlock, nil),
+		s.parser.EXPECT().
+			GetNativeTransaction(gomock.Any(), nativeBlock, transactionHash).
+			Return(nativeTransaction, nil),
+	)
+
+	resp, err := s.server.GetNativeTransaction(context.Background(), &api.GetNativeTransactionRequest{
+		TransactionHash: transactionHash,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Len(resp.GetTransactions(), 1)
+	require.Equal(nativeTransaction, resp.GetTransactions()[0])
+}
+
+func (s *handlerTestSuite) TestGetVerifiedAccountState() {
+	require := testutil.Require(s.T())
+
+	account := "0xabcd"
+	stateRootHash := "0x1234abcd"
+	height := uint64(1000)
+	tag := s.app.Config().GetLatestBlockTag()
+	blockMetadata := testutil.MakeBlockMetadatasFromStartHeight(height, 1, tag)[0]
+	block := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+	nativeBlock := testutil.MakeNativeBlock(block.Metadata.Height, tag)
+	require.NotNil(nativeBlock)
+	nativeBlock.GetEthereum().Header.StateRoot = stateRootHash
+
+	// Use the fixure and parse out the balance
+	expectedProof := []byte(fixtureAccountProof)
+	type AccountResult struct {
+		Balance     *hexutil.Big   `json:"balance"`
+		CodeHash    geth.Hash      `json:"codeHash"`
+		Nonce       hexutil.Uint64 `json:"nonce"`
+		StorageHash geth.Hash      `json:"storageHash"`
+	}
+	var accountResult AccountResult
+	err := json.Unmarshal(expectedProof, &accountResult)
+	require.NoError(err)
+
+	req := &api.ValidateAccountStateRequest{
+		AccountReq: &api.InternalGetVerifiedAccountStateRequest{
+			Account: account,
+			Height:  blockMetadata.Height,
+			Hash:    blockMetadata.Hash,
+		},
+		Block: nativeBlock,
+		AccountProof: &api.GetAccountProofResponse{
+			Response: &api.GetAccountProofResponse_Ethereum{
+				Ethereum: &api.EthereumAccountStateProof{
+					AccountProof: expectedProof,
+				},
+			},
+		},
+	}
+
+	result := &api.ValidateAccountStateResponse{
+		Balance: accountResult.Balance.String(),
+		Response: &api.ValidateAccountStateResponse_Ethereum{
+			Ethereum: &api.EthereumAccountStateResponse{
+				Nonce:       uint64(accountResult.Nonce),
+				StorageHash: accountResult.StorageHash.String(),
+				CodeHash:    accountResult.CodeHash.String(),
+			},
+		},
+	}
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, tag uint32, height uint64, hash string) (*api.BlockMetadata, error) {
+				require.Equal(blockMetadata.Tag, tag)
+				require.Equal(blockMetadata.Height, height)
+				require.Equal(blockMetadata.Hash, hash)
+				return blockMetadata, nil
+			},
+		),
+		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
+				require.Equal(blockMetadata.ObjectKeyMain, metadata.ObjectKeyMain)
+				return block, nil
+			},
+		),
+		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+				return nativeBlock, nil
+			},
+		),
+		s.blockchainClient.EXPECT().GetAccountProof(gomock.Any(), &api.GetVerifiedAccountStateRequest{
+			Req: &api.InternalGetVerifiedAccountStateRequest{
+				Account: account,
+				Height:  blockMetadata.Height,
+				Hash:    blockMetadata.Hash,
+			},
+		}).Times(1).DoAndReturn(
+			func(ctx context.Context, req *api.GetVerifiedAccountStateRequest) (*api.GetAccountProofResponse, error) {
+				return &api.GetAccountProofResponse{
+					Response: &api.GetAccountProofResponse_Ethereum{
+						Ethereum: &api.EthereumAccountStateProof{
+							AccountProof: []byte(fixtureAccountProof),
+						},
+					},
+				}, nil
+			},
+		),
+		s.parser.EXPECT().ValidateAccountState(gomock.Any(), req).Times(1).DoAndReturn(
+			func(ctx context.Context, req *api.ValidateAccountStateRequest) (*api.ValidateAccountStateResponse, error) {
+				return result, nil
+			},
+		),
+	)
+
+	resp, err := s.server.GetVerifiedAccountState(context.Background(), &api.GetVerifiedAccountStateRequest{
+		Req: &api.InternalGetVerifiedAccountStateRequest{
+			Account: account,
+			Height:  blockMetadata.Height,
+			Hash:    blockMetadata.Hash,
+		},
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+
+	require.Equal(result, resp.GetResponse())
+}
+
+func (s *handlerTestSuite) TestGetVerifiedAccountState_NotEnabled() {
+	require := testutil.Require(s.T())
+
+	// Disable this feature
+	s.config.Chain.Feature.VerifiedAccountStateEnabled = false
+	account := "0xabcd"
+	height := uint64(1000)
+	tag := s.app.Config().GetLatestBlockTag()
+	blockMetadata := testutil.MakeBlockMetadatasFromStartHeight(height, 1, tag)[0]
+
+	resp, err := s.server.GetVerifiedAccountState(context.Background(), &api.GetVerifiedAccountStateRequest{
+		Req: &api.InternalGetVerifiedAccountStateRequest{
+			Account: account,
+			Height:  blockMetadata.Height,
+			Hash:    blockMetadata.Hash,
+		},
+	})
+	require.ErrorIs(err, errNotImplemented)
+	require.Nil(resp)
+}
+
+func (s *handlerTestSuite) TestGetVerifiedAccountState_GetBlockByHash_Failure() {
+	require := testutil.Require(s.T())
+
+	account := "0xabcd"
+	height := uint64(1000)
+	tag := s.app.Config().GetLatestBlockTag()
+	blockMetadata := testutil.MakeBlockMetadatasFromStartHeight(height, 1, tag)[0]
+
+	errGetBlock := errors.New("failed to get block metadata with GetItem")
+	s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+		func(ctx context.Context, tag uint32, height uint64, hash string) (*api.BlockMetadata, error) {
+			require.Equal(blockMetadata.Tag, tag)
+			require.Equal(blockMetadata.Height, height)
+			require.Equal(blockMetadata.Hash, hash)
+			return nil, errGetBlock
+		},
+	)
+	resp, err := s.server.GetVerifiedAccountState(context.Background(), &api.GetVerifiedAccountStateRequest{
+		Req: &api.InternalGetVerifiedAccountStateRequest{
+			Account: account,
+			Height:  blockMetadata.Height,
+			Hash:    blockMetadata.Hash,
+		},
+	})
+	require.ErrorIs(err, errGetBlock)
+	require.Nil(resp)
+}
+
+func (s *handlerTestSuite) TestGetVerifiedAccountState_GetAccountProof_Failure() {
+	require := testutil.Require(s.T())
+
+	account := "0xabcd"
+	stateRootHash := "0x1234abcd"
+	height := uint64(1000)
+	tag := s.app.Config().GetLatestBlockTag()
+	blockMetadata := testutil.MakeBlockMetadatasFromStartHeight(height, 1, tag)[0]
+	block := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+	nativeBlock := testutil.MakeNativeBlock(block.Metadata.Height, tag)
+	require.NotNil(nativeBlock)
+	nativeBlock.GetEthereum().Header.StateRoot = stateRootHash
+
+	errGetProof := errors.New("failed to call eth_getProof")
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, tag uint32, height uint64, hash string) (*api.BlockMetadata, error) {
+				require.Equal(blockMetadata.Tag, tag)
+				require.Equal(blockMetadata.Height, height)
+				require.Equal(blockMetadata.Hash, hash)
+				return blockMetadata, nil
+			},
+		),
+		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
+				require.Equal(blockMetadata.ObjectKeyMain, metadata.ObjectKeyMain)
+				return block, nil
+			},
+		),
+		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+				return nativeBlock, nil
+			},
+		),
+		s.blockchainClient.EXPECT().GetAccountProof(gomock.Any(), &api.GetVerifiedAccountStateRequest{
+			Req: &api.InternalGetVerifiedAccountStateRequest{
+				Account: account,
+				Height:  blockMetadata.Height,
+				Hash:    blockMetadata.Hash,
+			},
+		}).Times(1).DoAndReturn(
+			func(ctx context.Context, req *api.GetVerifiedAccountStateRequest) (*api.GetAccountProofResponse, error) {
+				return nil, errGetProof
+			},
+		),
+	)
+
+	resp, err := s.server.GetVerifiedAccountState(context.Background(), &api.GetVerifiedAccountStateRequest{
+		Req: &api.InternalGetVerifiedAccountStateRequest{
+			Account: account,
+			Height:  blockMetadata.Height,
+			Hash:    blockMetadata.Hash,
+		},
+	})
+	require.ErrorIs(err, errGetProof)
+	require.Nil(resp)
+}
+
+func (s *handlerTestSuite) TestGetVerifiedAccountState_ValidateAccountState_Failure() {
+	require := testutil.Require(s.T())
+
+	account := "0xabcd"
+	stateRootHash := "0x1234abcd"
+	height := uint64(1000)
+	tag := s.app.Config().GetLatestBlockTag()
+	blockMetadata := testutil.MakeBlockMetadatasFromStartHeight(height, 1, tag)[0]
+	block := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+	nativeBlock := testutil.MakeNativeBlock(block.Metadata.Height, tag)
+	require.NotNil(nativeBlock)
+	nativeBlock.GetEthereum().Header.StateRoot = stateRootHash
+
+	expectedProof := []byte(fixtureAccountProof)
+	req := &api.ValidateAccountStateRequest{
+		AccountReq: &api.InternalGetVerifiedAccountStateRequest{
+			Account: account,
+			Height:  blockMetadata.Height,
+			Hash:    blockMetadata.Hash,
+		},
+		Block: nativeBlock,
+		AccountProof: &api.GetAccountProofResponse{
+			Response: &api.GetAccountProofResponse_Ethereum{
+				Ethereum: &api.EthereumAccountStateProof{
+					AccountProof: expectedProof,
+				},
+			},
+		},
+	}
+
+	errValidateAccountState := errors.New("failed to ValidateAccountState")
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, tag uint32, height uint64, hash string) (*api.BlockMetadata, error) {
+				require.Equal(blockMetadata.Tag, tag)
+				require.Equal(blockMetadata.Height, height)
+				require.Equal(blockMetadata.Hash, hash)
+				return blockMetadata, nil
+			},
+		),
+		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
+				require.Equal(blockMetadata.ObjectKeyMain, metadata.ObjectKeyMain)
+				return block, nil
+			},
+		),
+		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+				return nativeBlock, nil
+			},
+		),
+		s.blockchainClient.EXPECT().GetAccountProof(gomock.Any(), &api.GetVerifiedAccountStateRequest{
+			Req: &api.InternalGetVerifiedAccountStateRequest{
+				Account: account,
+				Height:  blockMetadata.Height,
+				Hash:    blockMetadata.Hash,
+			},
+		}).Times(1).DoAndReturn(
+			func(ctx context.Context, req *api.GetVerifiedAccountStateRequest) (*api.GetAccountProofResponse, error) {
+				return &api.GetAccountProofResponse{
+					Response: &api.GetAccountProofResponse_Ethereum{
+						Ethereum: &api.EthereumAccountStateProof{
+							AccountProof: []byte(fixtureAccountProof),
+						},
+					},
+				}, nil
+			},
+		),
+		s.parser.EXPECT().ValidateAccountState(gomock.Any(), req).Times(1).DoAndReturn(
+			func(ctx context.Context, req *api.ValidateAccountStateRequest) (*api.ValidateAccountStateResponse, error) {
+				return nil, errValidateAccountState
+			},
+		),
+	)
+
+	resp, err := s.server.GetVerifiedAccountState(context.Background(), &api.GetVerifiedAccountStateRequest{
+		Req: &api.InternalGetVerifiedAccountStateRequest{
+			Account: account,
+			Height:  blockMetadata.Height,
+			Hash:    blockMetadata.Hash,
+		},
+	})
+	require.ErrorIs(err, errValidateAccountState)
+	require.Nil(resp)
+}
+
+func (s *handlerTestSuite) TestGetVerifiedAccountState_Erc20() {
+	require := testutil.Require(s.T())
+
+	path := "parser/ethereum/account_proof_erc20_block_17300000.json"
+	expectedProof := fixtures.MustReadFile(path)
+
+	account := "0x467d543e5e4e41aeddf3b6d1997350dd9820a173"
+	contract := "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+
+	stateRootHash := "0x1234abcd"
+	height := uint64(1000)
+	tag := s.app.Config().GetLatestBlockTag()
+	blockMetadata := testutil.MakeBlockMetadatasFromStartHeight(height, 1, tag)[0]
+	block := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+	nativeBlock := testutil.MakeNativeBlock(block.Metadata.Height, tag)
+	require.NotNil(nativeBlock)
+	nativeBlock.GetEthereum().Header.StateRoot = stateRootHash
+
+	// Use the fixure and parse out the balance
+	var accountResult ethereum.AccountResult
+	err := json.Unmarshal(expectedProof, &accountResult)
+	require.NoError(err)
+
+	req := &api.ValidateAccountStateRequest{
+		AccountReq: &api.InternalGetVerifiedAccountStateRequest{
+			Account: account,
+			Height:  blockMetadata.Height,
+			Hash:    blockMetadata.Hash,
+			ExtraInput: &api.InternalGetVerifiedAccountStateRequest_Ethereum{
+				Ethereum: &api.EthereumExtraInput{
+					// USDC contract address
+					Erc20Contract: contract,
+				},
+			},
+		},
+		Block: nativeBlock,
+		AccountProof: &api.GetAccountProofResponse{
+			Response: &api.GetAccountProofResponse_Ethereum{
+				Ethereum: &api.EthereumAccountStateProof{
+					AccountProof: expectedProof,
+				},
+			},
+		},
+	}
+
+	result := &api.ValidateAccountStateResponse{
+		// This is the token balance in the proof.
+		Balance: accountResult.StorageProof[0].Value.ToInt().String(),
+		Response: &api.ValidateAccountStateResponse_Ethereum{
+			Ethereum: &api.EthereumAccountStateResponse{
+				Nonce:       uint64(accountResult.Nonce),
+				StorageHash: accountResult.StorageHash.String(),
+				CodeHash:    accountResult.CodeHash.String(),
+			},
+		},
+	}
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, tag uint32, height uint64, hash string) (*api.BlockMetadata, error) {
+				require.Equal(blockMetadata.Tag, tag)
+				require.Equal(blockMetadata.Height, height)
+				require.Equal(blockMetadata.Hash, hash)
+				return blockMetadata, nil
+			},
+		),
+		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
+				require.Equal(blockMetadata.ObjectKeyMain, metadata.ObjectKeyMain)
+				return block, nil
+			},
+		),
+		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+				return nativeBlock, nil
+			},
+		),
+		s.blockchainClient.EXPECT().GetAccountProof(gomock.Any(), &api.GetVerifiedAccountStateRequest{
+			Req: &api.InternalGetVerifiedAccountStateRequest{
+				Account: account,
+				Height:  blockMetadata.Height,
+				Hash:    blockMetadata.Hash,
+				ExtraInput: &api.InternalGetVerifiedAccountStateRequest_Ethereum{
+					Ethereum: &api.EthereumExtraInput{
+						// USDC contract address
+						Erc20Contract: contract,
+					},
+				},
+			},
+		}).Times(1).DoAndReturn(
+			func(ctx context.Context, req *api.GetVerifiedAccountStateRequest) (*api.GetAccountProofResponse, error) {
+				return &api.GetAccountProofResponse{
+					Response: &api.GetAccountProofResponse_Ethereum{
+						Ethereum: &api.EthereumAccountStateProof{
+							AccountProof: expectedProof,
+						},
+					},
+				}, nil
+			},
+		),
+		s.parser.EXPECT().ValidateAccountState(gomock.Any(), req).Times(1).DoAndReturn(
+			func(ctx context.Context, req *api.ValidateAccountStateRequest) (*api.ValidateAccountStateResponse, error) {
+				return result, nil
+			},
+		),
+	)
+
+	resp, err := s.server.GetVerifiedAccountState(context.Background(), &api.GetVerifiedAccountStateRequest{
+		Req: &api.InternalGetVerifiedAccountStateRequest{
+			Account: account,
+			Height:  blockMetadata.Height,
+			Hash:    blockMetadata.Hash,
+			ExtraInput: &api.InternalGetVerifiedAccountStateRequest_Ethereum{
+				Ethereum: &api.EthereumExtraInput{
+					// USDC contract address
+					Erc20Contract: contract,
+				},
+			},
+		},
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+
+	require.Equal(result, resp.GetResponse())
 }

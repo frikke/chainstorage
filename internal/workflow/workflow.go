@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
-	"time"
 
 	"github.com/go-playground/validator/v10"
-	"github.com/uber-go/tally"
+	"github.com/uber-go/tally/v4"
 	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
@@ -27,28 +27,32 @@ import (
 
 type (
 	Manager struct {
-		config         *config.Config
-		logger         *zap.Logger
-		runtime        cadence.Runtime
-		backfiller     *Backfiller
-		poller         *Poller
-		benchmarker    *Benchmarker
-		monitor        *Monitor
-		streamer       *Streamer
-		crossValidator *CrossValidator
+		config          *config.Config
+		logger          *zap.Logger
+		runtime         cadence.Runtime
+		backfiller      *Backfiller
+		poller          *Poller
+		benchmarker     *Benchmarker
+		monitor         *Monitor
+		streamer        *Streamer
+		crossValidator  *CrossValidator
+		eventBackfiller *EventBackfiller
+		replicator      *Replicator
 	}
 
 	ManagerParams struct {
 		fx.In
 		fxparams.Params
-		Lifecycle      fx.Lifecycle
-		Runtime        cadence.Runtime
-		Backfiller     *Backfiller
-		Poller         *Poller
-		Benchmarker    *Benchmarker
-		Monitor        *Monitor
-		Streamer       *Streamer
-		CrossValidator *CrossValidator
+		Lifecycle       fx.Lifecycle
+		Runtime         cadence.Runtime
+		Backfiller      *Backfiller
+		Poller          *Poller
+		Benchmarker     *Benchmarker
+		Monitor         *Monitor
+		Streamer        *Streamer
+		CrossValidator  *CrossValidator
+		EventBackfiller *EventBackfiller
+		Replicator      *Replicator
 	}
 
 	InstrumentedRequest interface {
@@ -67,10 +71,6 @@ type (
 )
 
 const (
-	activityRetryInitialInterval    = 10 * time.Second
-	activityRetryMaximumInterval    = 3 * time.Minute
-	activityRetryBackoffCoefficient = 2.0
-
 	loggerMsg = "workflow.request"
 
 	tagBlockTag = "tag"
@@ -79,14 +79,17 @@ const (
 
 func NewManager(params ManagerParams) *Manager {
 	mgr := &Manager{
-		config:         params.Config,
-		logger:         log.WithPackage(params.Logger),
-		runtime:        params.Runtime,
-		backfiller:     params.Backfiller,
-		benchmarker:    params.Benchmarker,
-		monitor:        params.Monitor,
-		streamer:       params.Streamer,
-		crossValidator: params.CrossValidator,
+		config:          params.Config,
+		logger:          log.WithPackage(params.Logger),
+		runtime:         params.Runtime,
+		backfiller:      params.Backfiller,
+		poller:          params.Poller,
+		benchmarker:     params.Benchmarker,
+		monitor:         params.Monitor,
+		streamer:        params.Streamer,
+		crossValidator:  params.CrossValidator,
+		eventBackfiller: params.EventBackfiller,
+		replicator:      params.Replicator,
 	}
 
 	params.Lifecycle.Append(fx.Hook{
@@ -104,6 +107,7 @@ func (m *Manager) onStart(ctx context.Context) error {
 		zap.String("env", string(m.config.Env())),
 		zap.String("blockchain", m.config.Blockchain().GetName()),
 		zap.String("network", m.config.Network().GetName()),
+		zap.String("sidechain", m.config.Sidechain().GetName()),
 	)
 
 	if err := m.runtime.OnStart(ctx); err != nil {
@@ -135,17 +139,17 @@ func newBaseWorkflow(config config.BaseWorkflowConfig, runtime cadence.Runtime) 
 	}
 }
 
-func (w *baseWorkflow) registerWorkflow(workflowFn interface{}) {
+func (w *baseWorkflow) registerWorkflow(workflowFn any) {
 	w.runtime.RegisterWorkflow(workflowFn, workflow.RegisterOptions{
 		Name: w.name,
 	})
 }
 
-func (w *baseWorkflow) validateRequest(request interface{}) error {
+func (w *baseWorkflow) validateRequest(request any) error {
 	return w.validateRequestCtx(context.Background(), request)
 }
 
-func (w *baseWorkflow) validateRequestCtx(ctx context.Context, request interface{}) error {
+func (w *baseWorkflow) validateRequestCtx(ctx context.Context, request any) error {
 	if err := w.validate.StructCtx(ctx, request); err != nil {
 		return xerrors.Errorf("invalid workflow request (name=%v, request=%+v): %w", w.name, request, err)
 	}
@@ -153,7 +157,7 @@ func (w *baseWorkflow) validateRequestCtx(ctx context.Context, request interface
 	return nil
 }
 
-func (w *baseWorkflow) startWorkflow(ctx context.Context, workflowID string, request interface{}) (client.WorkflowRun, error) {
+func (w *baseWorkflow) startWorkflow(ctx context.Context, workflowID string, request any) (client.WorkflowRun, error) {
 	if err := w.validateRequestCtx(ctx, request); err != nil {
 		return nil, err
 	}
@@ -162,9 +166,10 @@ func (w *baseWorkflow) startWorkflow(ctx context.Context, workflowID string, req
 	workflowOptions := client.StartWorkflowOptions{
 		ID:                                       workflowID,
 		TaskQueue:                                cfg.TaskList,
-		WorkflowRunTimeout:                       cfg.WorkflowExecutionTimeout,
+		WorkflowRunTimeout:                       cfg.WorkflowRunTimeout,
 		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 		WorkflowExecutionErrorWhenAlreadyStarted: true,
+		RetryPolicy:                              w.getRetryPolicy(cfg.WorkflowRetry),
 	}
 
 	execution, err := w.runtime.ExecuteWorkflow(ctx, workflowOptions, w.name, request)
@@ -175,11 +180,22 @@ func (w *baseWorkflow) startWorkflow(ctx context.Context, workflowID string, req
 	return execution, nil
 }
 
-func (w *baseWorkflow) executeWorkflow(ctx workflow.Context, request interface{}, fn instrument.Fn, opts ...instrument.Option) error {
+func (w *baseWorkflow) executeWorkflow(ctx workflow.Context, request any, fn instrument.Fn, opts ...instrument.Option) error {
+	workflowInfo := workflow.GetInfo(ctx)
+
+	// Check if this is the last attempt.
+	// This tag is used to determine if an alert should be sent for a failed workflow.
+	lastAttempt := true
+	if workflowInfo.RetryPolicy != nil && workflowInfo.Attempt < workflowInfo.RetryPolicy.MaximumAttempts {
+		lastAttempt = false
+	}
+
 	opts = append(
 		opts,
 		instrument.WithLoggerField(zap.String("workflow", w.name)),
 		instrument.WithLoggerField(zap.Reflect("request", request)),
+		instrument.WithLoggerField(zap.Bool("last_attempt", lastAttempt)),
+		instrument.WithScopeTag("last_attempt", strconv.FormatBool(lastAttempt)),
 		instrument.WithFilter(IsContinueAsNewError),
 	)
 	if ir, ok := request.(InstrumentedRequest); ok {
@@ -209,10 +225,10 @@ func (w *baseWorkflow) StopWorkflow(ctx context.Context, workflowID string, reas
 	return nil
 }
 
-func (w *baseWorkflow) readConfig(ctx workflow.Context, output interface{}) error {
+func (w *baseWorkflow) readConfig(ctx workflow.Context, output any) error {
 	// Read config as a SideEffect to guarantee deterministic workflow execution.
 	// As a result, config changes only take effect after finishing the current checkpoint.
-	val := workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} {
+	val := workflow.SideEffect(ctx, func(ctx workflow.Context) any {
 		return w.config
 	})
 
@@ -227,32 +243,66 @@ func (w *baseWorkflow) getLogger(ctx workflow.Context) *zap.Logger {
 	return log.WithPackage(w.runtime.GetLogger(ctx))
 }
 
-func (w *baseWorkflow) getScope(ctx workflow.Context) tally.Scope {
-	return w.runtime.GetScope(ctx).SubScope(w.name)
+func (w *baseWorkflow) getMetricsHandler(ctx workflow.Context) client.MetricsHandler {
+	return w.runtime.GetMetricsHandler(ctx)
 }
 
 func (w *baseWorkflow) withActivityOptions(ctx workflow.Context) workflow.Context {
 	cfg := w.config.Base()
 	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		TaskQueue:              cfg.TaskList,
-		ScheduleToStartTimeout: cfg.ActivityScheduleToStartTimeout,
 		StartToCloseTimeout:    cfg.ActivityStartToCloseTimeout,
+		ScheduleToCloseTimeout: cfg.ActivityScheduleToCloseTimeout,
 		HeartbeatTimeout:       cfg.ActivityHeartbeatTimeout,
-		RetryPolicy: &temporal.RetryPolicy{
-			InitialInterval:    activityRetryInitialInterval,
-			MaximumInterval:    activityRetryMaximumInterval,
-			BackoffCoefficient: activityRetryBackoffCoefficient,
-			MaximumAttempts:    cfg.ActivityRetryMaximumAttempts,
-		},
+		RetryPolicy:            w.getRetryPolicy(cfg.ActivityRetry),
 	})
+}
+
+func (w *baseWorkflow) getRetryPolicy(cfg *config.RetryPolicy) *temporal.RetryPolicy {
+	if cfg == nil || cfg.MaximumAttempts <= 0 {
+		return nil
+	}
+
+	return &temporal.RetryPolicy{
+		// Maximum number of attempts. 1 means no retry.
+		MaximumAttempts: cfg.MaximumAttempts,
+		// Coefficient used to calculate the next retry backoff interval.
+		BackoffCoefficient: cfg.BackoffCoefficient,
+		// Backoff interval for the first retry.
+		InitialInterval: cfg.InitialInterval,
+		// This value is the cap of the interval.
+		MaximumInterval: cfg.MaximumInterval,
+	}
+}
+
+// continueAsNew overrides the workflow options before the workflow is restarted;
+// otherwise, the workflow needs to be manually restarted whenever there is a change in StartWorkflowOptions.
+func (w *baseWorkflow) continueAsNew(ctx workflow.Context, request any) error {
+	cfg := w.config.Base()
+
+	// Override the workflow options to be carried over to the next run.
+	ctx = workflow.WithWorkflowRunTimeout(ctx, cfg.WorkflowRunTimeout)
+	options := workflow.ContinueAsNewErrorOptions{
+		RetryPolicy: w.getRetryPolicy(cfg.WorkflowRetry),
+	}
+
+	return workflow.NewContinueAsNewErrorWithOptions(ctx, options, w.name, request)
 }
 
 func IsContinueAsNewError(err error) bool {
 	return workflow.IsContinueAsNewError(err)
 }
 
-func IsErrSessionFailed(err error) bool {
-	return strings.Contains(err.Error(), workflow.ErrSessionFailed.Error())
+func IsErrSessionFailed(sessionCtx workflow.Context, err error) bool {
+	if strings.Contains(err.Error(), workflow.ErrSessionFailed.Error()) {
+		return true
+	}
+
+	if sessionInfo := workflow.GetSessionInfo(sessionCtx); sessionInfo != nil {
+		return sessionInfo.SessionState == workflow.SessionStateFailed
+	}
+
+	return false
 }
 
 func IsScheduleToStartTimeout(err error) bool {
@@ -265,10 +315,13 @@ func IsScheduleToStartTimeout(err error) bool {
 }
 
 func IsNodeProviderFailed(err error) bool {
-	var applicationErr *temporal.ApplicationError
-	if xerrors.As(err, &applicationErr) {
-		return applicationErr.Type() == a.ErrTypeNodeProvider
-	}
+	return strings.Contains(err.Error(), a.ErrTypeNodeProvider)
+}
 
-	return false
+func IsConsensusClusterFailure(err error) bool {
+	return strings.Contains(err.Error(), a.ErrTypeConsensusClusterFailure)
+}
+
+func IsConsensusValidationFailure(err error) bool {
+	return strings.Contains(err.Error(), a.ErrTypeConsensusValidationFailure)
 }
